@@ -34,6 +34,12 @@
 // cooldowns derive only from gateway answers; no wall-clock value and no
 // unseeded randomness ever enters a request. Timeouts only bound how long we
 // wait, never what we send.
+//
+// Layout of this file, top to bottom:
+//   Configuration (timeouts, caps, trail size) · environment and keys
+//   · request plumbing (readJson, sendJson, sendError) · upstream dialing and
+//   failover (dial, attemptCandidate, serveWithFailover) · routes (chat,
+//   messages, models, handle) · trial lifecycle (listen, register, poll, start).
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { appendFileSync } from 'node:fs';
@@ -62,6 +68,8 @@ import {
   type ServedModel,
 } from './lib/wire.ts';
 
+// ─── Configuration ───────────────────────────────────────────────────────────
+
 /** The wire protocol's version, in the register body. */
 const PROTOCOL_VERSION = 1;
 /** How often GET /work is polled, in milliseconds. */
@@ -76,6 +84,8 @@ const PROMPT_DEADLINE_MS = 28_000;
 const DEFAULT_MAX_TOKENS = 1024;
 /** Max upstream failures reported in one response header (the env reads at most 8). */
 const MAX_TRAIL_ROWS = 8;
+
+// ─── Environment and keys ────────────────────────────────────────────────────
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 const PROMPT_FILE = process.env.MAKEFUN_PROMPT_FILE ?? '';
@@ -126,6 +136,8 @@ function recordCall(model: string, status: number | null, code: string, ms: numb
   }
 }
 
+// ─── Request plumbing ────────────────────────────────────────────────────────
+
 /**
  * The gateway's Chat Completions route. OPENAI_BASE_URL is the OpenAI-compatible root (`…/v1` on the
  * trial network); a base that does not already end in `/v1` gets one, so both spellings reach the route.
@@ -151,7 +163,11 @@ function candidatesFor(requires: Requirement): ModelRow[] {
     .sort((a, b) => b.rating_milli - a.rating_milli || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 }
 
-/** The requirements of the prompt now arriving: the brief's row by arrival order, else the body's own. */
+/**
+ * The requirements of the prompt now arriving: the brief's row by arrival order, else the body's own.
+ * The index advances once per prompt, so a replay that sends the same bodies in the same order
+ * routes each one identically.
+ */
 function requirementsFor(body: Json): Requirement {
   const entry = brief.prompts[manifestIndex];
   manifestIndex += 1;
@@ -159,7 +175,11 @@ function requirementsFor(body: Json): Requirement {
   return requirementsFromBody(body);
 }
 
-/** Requirements read off a request body, when the brief has no row for it. */
+/**
+ * Requirements read off a request body, when the brief has no row for it.
+ * Vision is detected from image/image_url blocks in any message; tools from a
+ * non-empty tools array; JSON mode from the response_format type.
+ */
 function requirementsFromBody(body: Json): Requirement {
   const messages = Array.isArray(body.messages) ? body.messages : [];
   let vision = false;
@@ -192,6 +212,7 @@ async function readJson(req: IncomingMessage): Promise<Json | null> {
   }
 }
 
+/** A JSON body on the wire, with the caller's extra headers merged in. */
 function sendJson(res: ServerResponse, status: number, body: unknown, extraHeaders: Record<string, string> = {}): void {
   const text = JSON.stringify(body);
   res.writeHead(status, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(text), ...extraHeaders });
@@ -216,6 +237,8 @@ function models(req: IncomingMessage, res: ServerResponse): void {
   else sendJson(res, 200, openAIModelList(list));
 }
 
+// ─── Upstream dialing and failover ───────────────────────────────────────────
+
 /** One gateway call's error code, from its JSON error body when it has one. */
 function errorCodeOf(text: string, status: number): string {
   try {
@@ -231,10 +254,19 @@ function errorCodeOf(text: string, status: number): string {
   return `http_${status}`;
 }
 
-/** Ensure the upstream body always names an output cap (the gateway refuses uncapped calls). */
+/**
+ * Ensure the upstream body always names a usable output cap (the gateway refuses uncapped calls).
+ * A cap counts only when it is a finite number: a null or non-finite cap is no cap at all, so it is
+ * dropped and the default takes its place instead of reaching the gateway unparseable.
+ */
 function withCap(body: Json): Json {
-  if (typeof body.max_tokens === 'number' || typeof body.max_completion_tokens === 'number') return body;
-  return { ...body, max_tokens: DEFAULT_MAX_TOKENS };
+  const hasCap =
+    (typeof body.max_tokens === 'number' && Number.isFinite(body.max_tokens)) ||
+    (typeof body.max_completion_tokens === 'number' && Number.isFinite(body.max_completion_tokens));
+  if (hasCap) return body;
+  const next: Json = { ...body, max_tokens: DEFAULT_MAX_TOKENS };
+  delete next.max_completion_tokens;
+  return next;
 }
 
 /** POST one request to the gateway's Chat Completions route, naming the model dialled. */
@@ -266,6 +298,20 @@ interface UpstreamFail {
   lastText: string;
 }
 
+/**
+ * One candidate's single attempt: the dial, the refusal bookkeeping, and the verdict.
+ * Split out of serveWithFailover so the per-model decision — serve, refuse, or abort the
+ * whole failover — reads in one place.
+ */
+interface AttemptResult {
+  /** The model + payload when one answered validly; null when the attempt refused. */
+  served: { model: string; payload: Json | string } | null;
+  /** Refusals from this attempt (empty when served). */
+  failures: Array<{ status: number; code: string; model: string | null }>;
+  /** True when failover must stop now (a 401: no key, every model refuses the same way). */
+  abort: boolean;
+}
+
 /** A Chat Completions answer's text (string content, or its text blocks joined). */
 function answerTextOf(body: Json): string {
   const choices = Array.isArray(body.choices) ? body.choices : [];
@@ -279,6 +325,7 @@ function answerTextOf(body: Json): string {
   return '';
 }
 
+/** Whether a Chat Completions answer carries at least one tool call. */
 function hasToolCalls(body: Json): boolean {
   const choices = Array.isArray(body.choices) ? body.choices : [];
   const message = isRecord(choices[0]) && isRecord(choices[0].message) ? choices[0].message : {};
@@ -323,7 +370,11 @@ function validJsonAnswer(body: Json): boolean {
   return answerTextOf(body) !== '' || hasToolCalls(body);
 }
 
-/** Summary of a buffered SSE body: did it finish, end with [DONE], carry text / tool calls? */
+/**
+ * Summary of a buffered SSE body: did it finish, end with [DONE], carry text / tool calls?
+ * A stream counts as served only when it finished AND sent [DONE] AND carried text or a tool
+ * call — anything less is a truncated answer, and the next candidate is tried instead.
+ */
 function summarizeSse(text: string): { finished: boolean; done: boolean; text: string; toolCalls: boolean } {
   let finished = false;
   let done = false;
@@ -366,6 +417,62 @@ function streamOf(text: string): ReadableStream<Uint8Array> {
 }
 
 /**
+ * One candidate, one attempt. The refusal bookkeeping lives here, so serveWithFailover only
+ * decides the order:
+ *   - transport fault (timeout / unreachable): refusal, no blacklist — the next prompt may
+ *     find the gateway healthy again;
+ *   - 429 / 403: refusal, and the model is blacklisted for the rest of the trial (a rate
+ *     limit holds; a 403 such as inkling-2-small's "only available on agentic harnesses"
+ *     never clears);
+ *   - 401: refusal, and failover aborts — with no key every model refuses the same way;
+ *   - any other refusal (5xx, empty answer, truncated stream): refusal, no blacklist —
+ *     it may be transient, so the model stays eligible for later prompts.
+ */
+async function attemptCandidate(candidate: ModelRow, upstreamBody: Json, streaming: boolean): Promise<AttemptResult> {
+  const started = Date.now();
+  let upstream: Response;
+  try {
+    upstream = await dial(candidate.id, upstreamBody);
+  } catch (err) {
+    const ms = Date.now() - started;
+    const code = (err as Error).name === 'TimeoutError' ? 'timeout' : 'upstream_unreachable';
+    recordCall(candidate.id, null, code, ms, false);
+    return { served: null, failures: [{ status: 504, code, model: candidate.id }], abort: false };
+  }
+  if (!upstream.ok || upstream.body === null) {
+    const text = await upstream.text().catch(() => '');
+    const ms = Date.now() - started;
+    const code = errorCodeOf(text, upstream.status);
+    recordCall(candidate.id, upstream.status, code, ms, false);
+    if (upstream.status === 429 || upstream.status === 403) refusedModels.add(candidate.id);
+    return {
+      served: null,
+      failures: [{ status: upstream.status, code, model: candidate.id }],
+      abort: upstream.status === 401,
+    };
+  }
+  if (streaming) {
+    const raw = await upstream.text().catch(() => '');
+    const ms = Date.now() - started;
+    const summary = summarizeSse(raw);
+    if (!summary.finished || !summary.done || (summary.text === '' && !summary.toolCalls)) {
+      recordCall(candidate.id, upstream.status, 'truncated_stream', ms, false);
+      return { served: null, failures: [{ status: 502, code: 'truncated_stream', model: candidate.id }], abort: false };
+    }
+    recordCall(candidate.id, upstream.status, 'ok', ms, true);
+    return { served: { model: candidate.id, payload: raw }, failures: [], abort: false };
+  }
+  const answer: unknown = await upstream.json().catch(() => null);
+  const ms = Date.now() - started;
+  if (!isRecord(answer) || !validJsonAnswer(answer)) {
+    recordCall(candidate.id, upstream.status, 'empty_answer', ms, false);
+    return { served: null, failures: [{ status: 502, code: 'empty_answer', model: candidate.id }], abort: false };
+  }
+  recordCall(candidate.id, upstream.status, 'ok', ms, true);
+  return { served: { model: candidate.id, payload: withFinishReason(withUsage(answer)) }, failures: [], abort: false };
+}
+
+/**
  * Dial the candidates in order until one answers validly. Returns the winning
  * model + payload, or the refusals when every candidate failed. Streaming
  * answers are read fully and validated before they count as served, so a
@@ -376,57 +483,17 @@ async function serveWithFailover(upstreamBody: Json, candidates: ModelRow[], dea
   const streaming = upstreamBody.stream === true;
   for (const candidate of candidates) {
     if (Date.now() > deadlineMs) break;
-    const started = Date.now();
-    let upstream: Response;
-    try {
-      upstream = await dial(candidate.id, upstreamBody);
-    } catch (err) {
-      const ms = Date.now() - started;
-      const code = (err as Error).name === 'TimeoutError' ? 'timeout' : 'upstream_unreachable';
-      recordCall(candidate.id, null, code, ms, false);
-      // Transient transport fault: do NOT blacklist across prompts — the next
-      // prompt may find the gateway healthy again.
-      failures.push({ status: 504, code, model: candidate.id });
-      continue;
+    const attempt = await attemptCandidate(candidate, upstreamBody, streaming);
+    failures.push(...attempt.failures);
+    if (attempt.abort) break;
+    if (attempt.served !== null) {
+      return { ok: true, model: attempt.served.model, payload: attempt.served.payload, failures };
     }
-    if (!upstream.ok || upstream.body === null) {
-      const text = await upstream.text().catch(() => '');
-      const ms = Date.now() - started;
-      const code = errorCodeOf(text, upstream.status);
-      recordCall(candidate.id, upstream.status, code, ms, false);
-      // Only a 429 or 403 is blacklisted across prompts: a rate limit holds for
-      // the trial, and a 403 ("only available on agentic harnesses", as
-      // inkling-2-small answers this key) never clears. A 5xx / empty /
-      // truncated answer may be transient, so that model stays eligible later.
-      if (upstream.status === 429 || upstream.status === 403) refusedModels.add(candidate.id);
-      failures.push({ status: upstream.status, code, model: candidate.id });
-      if (upstream.status === 401) break; // No key: every model refuses the same way.
-      continue;
-    }
-    if (streaming) {
-      const raw = await upstream.text().catch(() => '');
-      const ms = Date.now() - started;
-      const summary = summarizeSse(raw);
-      if (!summary.finished || !summary.done || (summary.text === '' && !summary.toolCalls)) {
-        recordCall(candidate.id, upstream.status, 'truncated_stream', ms, false);
-        failures.push({ status: 502, code: 'truncated_stream', model: candidate.id });
-        continue;
-      }
-      recordCall(candidate.id, upstream.status, 'ok', ms, true);
-      return { ok: true, model: candidate.id, payload: raw, failures };
-    }
-    const answer: unknown = await upstream.json().catch(() => null);
-    const ms = Date.now() - started;
-    if (!isRecord(answer) || !validJsonAnswer(answer)) {
-      recordCall(candidate.id, upstream.status, 'empty_answer', ms, false);
-      failures.push({ status: 502, code: 'empty_answer', model: candidate.id });
-      continue;
-    }
-    recordCall(candidate.id, upstream.status, 'ok', ms, true);
-    return { ok: true, model: candidate.id, payload: withFinishReason(withUsage(answer)), failures };
   }
   return { ok: false, failures, lastStatus: failures.length > 0 ? failures[failures.length - 1].status : 502, lastText: 'every free model that meets this request refused it' };
 }
+
+// ─── Routes ──────────────────────────────────────────────────────────────────
 
 /** POST /v1/chat/completions: an OpenAI-shaped client, answered by the best free model that serves it. */
 async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -492,6 +559,8 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   }
   sendError(res, url.pathname === '/v1/messages' ? 'anthropic' : 'openai', 404, 'not_found', `no route ${req.method ?? ''} ${url.pathname}`);
 }
+
+// ─── Trial lifecycle ─────────────────────────────────────────────────────────
 
 function listen(server: Server): Promise<void> {
   return new Promise((resolve, reject) => {
