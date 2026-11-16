@@ -24,6 +24,10 @@
 // randomness, so the same body and the same gateway answer give the same bytes on a replay. The two
 // model listings use fixed timestamps for the same reason: a `created` that moved between runs would be
 // a nondeterministic document.
+//
+// Layout: model listings and errors · content helpers · Anthropic → OpenAI
+// (anthropicToOpenAI) · OpenAI → Anthropic (openAIToAnthropic, openAIJsonWithModel)
+// · SSE relays (openAIStreamWithModel, anthropicEventsFromOpenAI).
 
 import { isRecord, type Json } from './providers.ts';
 
@@ -33,6 +37,8 @@ export interface ServedModel {
   provider: string;
   display_name: string;
 }
+
+// ─── Model listings and errors ───────────────────────────────────────────────
 
 /** A fixed epoch second for every listed model's `created`: nothing in the reply reads the clock. */
 const FIXED_OPENAI_CREATED = 1767225600;
@@ -65,11 +71,19 @@ export function openAIError(message: string, type: string, code: string | null):
   return { error: { message, type, code } };
 }
 
+// ─── Content helpers ─────────────────────────────────────────────────────────
+
 /** The text of a string or of a block array's text blocks; '' when there is none. */
 function textOf(content: unknown): string {
   if (typeof content === 'string') return content;
   if (!Array.isArray(content)) return '';
   return content.flatMap((b) => (isRecord(b) && b.type === 'text' && typeof b.text === 'string' ? [b.text] : [])).join('\n');
+}
+
+/** The text of a Chat Completions message: its string content, or its text blocks joined. */
+function messageTextOf(message: Json): string {
+  if (typeof message.content === 'string') return message.content;
+  return textOf(message.content);
 }
 
 /** One Anthropic content block as an OpenAI content part: text or an inline image; null for the rest. */
@@ -118,17 +132,63 @@ export function stopReasonOf(finish: unknown): string {
   return 'end_turn';
 }
 
+// ─── Anthropic → OpenAI ──────────────────────────────────────────────────────
+
 /**
- * An Anthropic Messages request as an OpenAI Chat Completions request that names `model`: the system
- * prompt becomes a system message, image blocks become image_url data URLs, tool_use blocks become
- * tool_calls, tool_result blocks become tool messages, tools and tool_choice are rewritten, and the
- * output cap, temperature, top_p, stop sequences and streaming pass through.
+ * One assistant turn's blocks as an OpenAI assistant message: its text (or null when the turn
+ * only calls tools) plus any tool_calls, in the turn's order.
  */
-export function anthropicToOpenAI(body: Json, model: string): Json {
+function assistantMessageOf(content: Json[]): Json {
+  const toolCalls: Json[] = [];
+  for (const block of content) {
+    if (!isRecord(block) || block.type !== 'tool_use') continue;
+    toolCalls.push({
+      id: typeof block.id === 'string' ? block.id : '',
+      type: 'function',
+      function: {
+        name: typeof block.name === 'string' ? block.name : '',
+        arguments: JSON.stringify(isRecord(block.input) ? block.input : {}),
+      },
+    });
+  }
+  const text = textOf(content);
+  return {
+    role: 'assistant',
+    content: text !== '' ? text : null,
+    ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
+  };
+}
+
+/**
+ * One user turn's blocks as OpenAI messages: each tool_result becomes its own tool message in
+ * place, and the remaining text/image parts become one user message at the end, if there are any.
+ */
+function userMessagesOf(content: Json[]): Json[] {
   const messages: Json[] = [];
-  const system = textOf(body.system);
-  if (system !== '') messages.push({ role: 'system', content: system });
-  const source = Array.isArray(body.messages) ? body.messages : [];
+  const parts: Json[] = [];
+  for (const block of content) {
+    if (!isRecord(block)) continue;
+    if (block.type === 'tool_result') {
+      messages.push({
+        role: 'tool',
+        tool_call_id: typeof block.tool_use_id === 'string' ? block.tool_use_id : '',
+        content: toolResultText(block.content),
+      });
+      continue;
+    }
+    const part = partOf(block);
+    if (part !== null) parts.push(part);
+  }
+  if (parts.length > 0) messages.push({ role: 'user', content: parts });
+  return messages;
+}
+
+/**
+ * An Anthropic message array as OpenAI messages. A string turn passes through as one message;
+ * a block turn is split by role (assistantMessageOf / userMessagesOf); anything else is dropped.
+ */
+function openAIMessagesOf(source: unknown[]): Json[] {
+  const messages: Json[] = [];
   for (const raw of source) {
     if (!isRecord(raw)) continue;
     const assistant = raw.role === 'assistant';
@@ -139,70 +199,62 @@ export function anthropicToOpenAI(body: Json, model: string): Json {
     }
     if (!Array.isArray(content)) continue;
     if (assistant) {
-      const toolCalls: Json[] = [];
-      for (const block of content) {
-        if (!isRecord(block) || block.type !== 'tool_use') continue;
-        toolCalls.push({
-          id: typeof block.id === 'string' ? block.id : '',
-          type: 'function',
-          function: {
-            name: typeof block.name === 'string' ? block.name : '',
-            arguments: JSON.stringify(isRecord(block.input) ? block.input : {}),
-          },
-        });
-      }
-      const text = textOf(content);
-      messages.push({
-        role: 'assistant',
-        content: text !== '' ? text : null,
-        ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
-      });
+      messages.push(assistantMessageOf(content));
       continue;
     }
-    const parts: Json[] = [];
-    for (const block of content) {
-      if (!isRecord(block)) continue;
-      if (block.type === 'tool_result') {
-        messages.push({
-          role: 'tool',
-          tool_call_id: typeof block.tool_use_id === 'string' ? block.tool_use_id : '',
-          content: toolResultText(block.content),
-        });
-        continue;
-      }
-      const part = partOf(block);
-      if (part !== null) parts.push(part);
-    }
-    if (parts.length > 0) messages.push({ role: 'user', content: parts });
+    for (const message of userMessagesOf(content)) messages.push(message);
   }
+  return messages;
+}
+
+/** An Anthropic tools array as OpenAI tools: nameless entries are dropped. */
+function openAIToolsOf(rawTools: unknown): Json[] {
+  if (!Array.isArray(rawTools)) return [];
+  return rawTools.flatMap((raw) => {
+    if (!isRecord(raw) || typeof raw.name !== 'string') return [];
+    return [
+      {
+        type: 'function',
+        function: {
+          name: raw.name,
+          description: typeof raw.description === 'string' ? raw.description : '',
+          parameters: isRecord(raw.input_schema) ? raw.input_schema : { type: 'object', properties: {} },
+        },
+      },
+    ];
+  });
+}
+
+/** An Anthropic tool_choice as an OpenAI one; anything else leaves the choice unset. */
+function openAIToolChoiceOf(choice: unknown): Json | string | undefined {
+  if (!isRecord(choice)) return undefined;
+  if (choice.type === 'auto') return 'auto';
+  if (choice.type === 'any') return 'required';
+  if (choice.type === 'tool' && typeof choice.name === 'string') return { type: 'function', function: { name: choice.name } };
+  return undefined;
+}
+
+/**
+ * An Anthropic Messages request as an OpenAI Chat Completions request that names `model`: the system
+ * prompt becomes a system message, image blocks become image_url data URLs, tool_use blocks become
+ * tool_calls, tool_result blocks become tool messages, tools and tool_choice are rewritten, and the
+ * output cap, temperature, top_p, stop sequences and streaming pass through.
+ */
+export function anthropicToOpenAI(body: Json, model: string): Json {
+  const messages: Json[] = [];
+  const system = textOf(body.system);
+  if (system !== '') messages.push({ role: 'system', content: system });
+  for (const message of openAIMessagesOf(Array.isArray(body.messages) ? body.messages : [])) messages.push(message);
 
   const out: Json = { model, messages };
   if (typeof body.max_tokens === 'number') out.max_tokens = body.max_tokens;
   if (typeof body.temperature === 'number') out.temperature = body.temperature;
   if (typeof body.top_p === 'number') out.top_p = body.top_p;
   if (Array.isArray(body.stop_sequences) && body.stop_sequences.length > 0) out.stop = body.stop_sequences;
-  if (Array.isArray(body.tools)) {
-    const tools = body.tools.flatMap((raw) => {
-      if (!isRecord(raw) || typeof raw.name !== 'string') return [];
-      return [
-        {
-          type: 'function',
-          function: {
-            name: raw.name,
-            description: typeof raw.description === 'string' ? raw.description : '',
-            parameters: isRecord(raw.input_schema) ? raw.input_schema : { type: 'object', properties: {} },
-          },
-        },
-      ];
-    });
-    if (tools.length > 0) out.tools = tools;
-  }
-  const choice = body.tool_choice;
-  if (isRecord(choice)) {
-    if (choice.type === 'auto') out.tool_choice = 'auto';
-    else if (choice.type === 'any') out.tool_choice = 'required';
-    else if (choice.type === 'tool' && typeof choice.name === 'string') out.tool_choice = { type: 'function', function: { name: choice.name } };
-  }
+  const tools = openAIToolsOf(body.tools);
+  if (tools.length > 0) out.tools = tools;
+  const toolChoice = openAIToolChoiceOf(body.tool_choice);
+  if (toolChoice !== undefined) out.tool_choice = toolChoice;
   if (body.stream === true) {
     out.stream = true;
     out.stream_options = { include_usage: true };
@@ -210,8 +262,26 @@ export function anthropicToOpenAI(body: Json, model: string): Json {
   return out;
 }
 
+// ─── OpenAI → Anthropic ──────────────────────────────────────────────────────
+
 function numberOrZero(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : 0;
+}
+
+/** A Chat Completions message's tool calls, as Anthropic tool_use blocks (unknown ids are named). */
+function toolUseBlocksOf(message: Json): Json[] {
+  const calls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
+  const blocks: Json[] = [];
+  for (const call of calls) {
+    if (!isRecord(call) || !isRecord(call.function)) continue;
+    blocks.push({
+      type: 'tool_use',
+      id: typeof call.id === 'string' ? call.id : 'toolu_unknown',
+      name: typeof call.function.name === 'string' ? call.function.name : '',
+      input: argumentsOf(call.function.arguments),
+    });
+  }
+  return blocks;
 }
 
 /** A Chat Completions answer as an Anthropic Messages object. `model` is the id the entry dialled. */
@@ -220,18 +290,9 @@ export function openAIToAnthropic(body: Json, model: string): Json {
   const choice = isRecord(choices[0]) ? choices[0] : {};
   const message = isRecord(choice.message) ? choice.message : {};
   const content: Json[] = [];
-  const text = typeof message.content === 'string' ? message.content : textOf(message.content);
+  const text = messageTextOf(message);
   if (text !== '') content.push({ type: 'text', text });
-  const calls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
-  for (const call of calls) {
-    if (!isRecord(call) || !isRecord(call.function)) continue;
-    content.push({
-      type: 'tool_use',
-      id: typeof call.id === 'string' ? call.id : 'toolu_unknown',
-      name: typeof call.function.name === 'string' ? call.function.name : '',
-      input: argumentsOf(call.function.arguments),
-    });
-  }
+  for (const block of toolUseBlocksOf(message)) content.push(block);
   if (content.length === 0) content.push({ type: 'text', text: '' });
   const usage = isRecord(body.usage) ? body.usage : {};
   return {
@@ -250,6 +311,8 @@ export function openAIToAnthropic(body: Json, model: string): Json {
 export function openAIJsonWithModel(body: Json, model: string): Json {
   return { ...body, model };
 }
+
+// ─── SSE relays ──────────────────────────────────────────────────────────────
 
 /** One server-sent event: `event: <name>` when named, then the JSON data line, then the blank line. */
 export function sseEvent(event: string | null, data: unknown): string {
