@@ -1,0 +1,1 @@
+{"description":"One server, two API wires, live free OpenRouter models behind every answer (make.fun free-model-aggregator-02).","license":"MIT","name":"free-model-aggregator-02","private":true,"scripts":{"list":"node main.ts --list","start":"node main.ts"},"type":"module","version":"1.0.0"}
