@@ -20,8 +20,14 @@
 //
 // Everything here is deterministic: no clock and no randomness, so `node main.ts --list` and the
 // register body build the same document, byte for byte, on a live pass and on its replay.
+//
+// Layout: schemas and constants · row shapes · brief scanning (documentsIn,
+// objectEnd, arrayDocument) · row parsing (modelOf, promptOf) · the sealed
+// fallback table · reading the brief (readBrief) · routing helpers and the catalog.
 
 import { readFileSync } from 'node:fs';
+
+// ─── Schemas and constants ───────────────────────────────────────────────────
 
 export const MODELS_SCHEMA = 'free-model-aggregator-02/models/v1';
 export const PROMPTS_SCHEMA = 'free-model-aggregator-02/prompts/v1';
@@ -33,6 +39,8 @@ const SCHEMA_PREFIX = 'free-model-aggregator-02/';
 export const OPENROUTER_PUBLIC_BASE = 'https://openrouter.ai/api/v1';
 /** The environment variable an entrant's OpenRouter key is pushed under (an entry secret, kept out of the sandbox). */
 export const OPENROUTER_KEY_ENV = 'OPENROUTER_API_KEY';
+
+// ─── Row shapes ──────────────────────────────────────────────────────────────
 
 export type Json = Record<string, unknown>;
 export const isRecord = (v: unknown): v is Json => v !== null && typeof v === 'object' && !Array.isArray(v);
@@ -105,6 +113,8 @@ export interface Capabilities {
   json: boolean | null;
 }
 
+// ─── Brief scanning ──────────────────────────────────────────────────────────
+
 /** Every JSON object in `text` that carries a string `schema`, in the order they appear. */
 function documentsIn(text: string): Json[] {
   const out: Json[] = [];
@@ -121,7 +131,10 @@ function documentsIn(text: string): Json[] {
   return out;
 }
 
-/** The index of the `}` closing the object that opens at `start`, or -1; string contents are skipped. */
+/**
+ * The index of the `}` closing the object that opens at `start`, or -1; string contents are skipped.
+ * A backslash inside a string escapes the next character, so an escaped quote never ends the string.
+ */
 function objectEnd(text: string, start: number): number {
   let depth = 0;
   let inString = false;
@@ -140,14 +153,17 @@ function objectEnd(text: string, start: number): number {
   return -1;
 }
 
+/** A value as a string, or '' when it is not one. */
 function stringOf(v: unknown): string {
   return typeof v === 'string' ? v : '';
 }
 
+/** A value as a finite number, or null when it is not one. */
 function numberOrNull(v: unknown): number | null {
   return typeof v === 'number' && Number.isFinite(v) ? v : null;
 }
 
+/** A value as a boolean, or null when it is not one (null = the brief did not say). */
 function boolOrNull(v: unknown): boolean | null {
   return typeof v === 'boolean' ? v : null;
 }
@@ -165,6 +181,17 @@ function arrayDocument(docs: readonly Json[], keys: readonly string[]): { doc: J
   return null;
 }
 
+// ─── Row parsing ─────────────────────────────────────────────────────────────
+
+/**
+ * The gateway id for a model row: the row's `id`, or its `model` under the provider that names it.
+ * A row that gives the bare OpenRouter id (`vendor/model:free`) and names `openrouter` is routed as
+ * the gateway spells it (`openrouter/vendor/model:free`).
+ */
+function gatewayIdOf(raw: string, named: string): string {
+  return named === 'openrouter' && !raw.toLowerCase().startsWith('openrouter/') ? `openrouter/${raw}` : raw;
+}
+
 /**
  * One model row. The id is the row's `id`, or its `model` under the provider that names it: a row that
  * gives the bare OpenRouter id (`vendor/model:free`) and names `openrouter` is routed as the gateway
@@ -176,9 +203,8 @@ function modelOf(v: unknown): ModelRow | null {
   const raw = stringOf(v.id) !== '' ? stringOf(v.id) : stringOf(v.model);
   if (raw === '') return null;
   const named = stringOf(v.provider) !== '' ? stringOf(v.provider) : stringOf(v.wire);
-  const id = named === 'openrouter' && !raw.toLowerCase().startsWith('openrouter/') ? `openrouter/${raw}` : raw;
   return {
-    id,
+    id: gatewayIdOf(raw, named),
     provider: named === '' ? 'openrouter' : named,
     display_name: stringOf(v.display_name) !== '' ? stringOf(v.display_name) : raw,
     rating_milli: numberOrNull(v.rating_milli) ?? 0,
@@ -190,24 +216,35 @@ function modelOf(v: unknown): ModelRow | null {
   };
 }
 
+/**
+ * One prompt's requirements, from its `requires` object: only `true` flags are kept, so an absent
+ * or false flag never constrains routing, and a non-finite min_context is dropped.
+ */
+function requirementOf(v: unknown): Requirement {
+  const requires = isRecord(v) ? v : {};
+  return {
+    ...(requires.tools === true ? { tools: true } : {}),
+    ...(requires.vision === true ? { vision: true } : {}),
+    ...(requires.json === true ? { json: true } : {}),
+    ...(typeof requires.min_context === 'number' && Number.isFinite(requires.min_context) ? { min_context: requires.min_context } : {}),
+  };
+}
+
+/** One prompt row: an empty id is not a prompt, and anything but `anthropic` reads as OpenAI. */
 function promptOf(v: unknown): PromptRow | null {
   if (!isRecord(v)) return null;
   const id = stringOf(v.id);
   if (id === '') return null;
-  const requires = isRecord(v.requires) ? v.requires : {};
   return {
     id,
     api: v.api === 'anthropic' ? 'anthropic' : 'openai',
     stream: v.stream === true,
     weight: v.weight === 2 ? 2 : 1,
-    requires: {
-      ...(requires.tools === true ? { tools: true } : {}),
-      ...(requires.vision === true ? { vision: true } : {}),
-      ...(requires.json === true ? { json: true } : {}),
-      ...(typeof requires.min_context === 'number' && Number.isFinite(requires.min_context) ? { min_context: requires.min_context } : {}),
-    },
+    requires: requirementOf(v.requires),
   };
 }
+
+// ─── The sealed fallback table ───────────────────────────────────────────────
 
 /**
  * The fourteen free models as the house's sealed table lists them (env/server.mjs
@@ -232,6 +269,24 @@ export const FALLBACK_MODELS: ModelRow[] = [
   { id: 'openrouter/thinkingmachines/inkling-2-small:free', provider: 'openrouter', display_name: 'Thinking Machines: Inkling 2 Small (free)', rating_milli: 1475, context_length: 1048576, tools: true, vision: true, json: false, free: true },
 ];
 
+// ─── Reading the brief ───────────────────────────────────────────────────────
+
+/** The models of a parsed models document, in the document's order; unparseable rows are dropped. */
+function parseModels(modelsDoc: { doc: Json; key: string }): ModelRow[] {
+  return (modelsDoc.doc[modelsDoc.key] as unknown[]).flatMap((v) => {
+    const m = modelOf(v);
+    return m === null ? [] : [m];
+  });
+}
+
+/** The prompts of a parsed prompts document, in the document's order; unparseable rows are dropped. */
+function parsePrompts(promptsDoc: { doc: Json; key: string }): PromptRow[] {
+  return (promptsDoc.doc[promptsDoc.key] as unknown[]).flatMap((v) => {
+    const p = promptOf(v);
+    return p === null ? [] : [p];
+  });
+}
+
 /** The brief at `path`, its two documents found under this contest's schema prefix. */
 export function readBrief(path: string): Brief {
   if (path === '') return { models: FALLBACK_MODELS, prompts: [], error: 'MAKEFUN_PROMPT_FILE is not set (using the sealed fourteen-model table)' };
@@ -246,20 +301,15 @@ export function readBrief(path: string): Brief {
   if (modelsDoc === null) {
     return { models: FALLBACK_MODELS, prompts: [], error: `the brief at ${path} holds no ${MODELS_SCHEMA} document (using the sealed fourteen-model table)` };
   }
-  const models = (modelsDoc.doc[modelsDoc.key] as unknown[]).flatMap((v) => {
-    const m = modelOf(v);
-    return m === null ? [] : [m];
-  });
+  const models = parseModels(modelsDoc);
   const promptsDoc = arrayDocument(docs, ['prompts', 'manifest']);
   if (promptsDoc === null) {
     return { models, prompts: [], error: `the brief at ${path} holds no ${PROMPTS_SCHEMA} document` };
   }
-  const prompts = (promptsDoc.doc[promptsDoc.key] as unknown[]).flatMap((v) => {
-    const p = promptOf(v);
-    return p === null ? [] : [p];
-  });
-  return { models, prompts, error: null };
+  return { models, prompts: parsePrompts(promptsDoc), error: null };
 }
+
+// ─── Routing helpers and the catalog ─────────────────────────────────────────
 
 /** The models this entry may serve: the brief's free ones, in the brief's order. */
 export function freeModels(brief: Brief): ModelRow[] {
